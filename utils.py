@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 def try_gpu(num_list):
     """If GPU is available, return mx.gpu(0); else return mx.cpu()"""
     ctx = []
+    print(num_list)
     for num in num_list:
         try:
             tmp_ctx = mx.gpu(int(num))
@@ -53,8 +54,9 @@ def bbox_iou(box1, box2, transform=True):
     inter_rect_y2 = nd.where(b1_y2 < b2_y2, b1_y2, b2_y2)
 
     # Intersection area
-    inter_area = nd.clip(inter_rect_x2 - inter_rect_x1 + 1, a_min=0, a_max=10000) * nd.clip(
-        inter_rect_y2 - inter_rect_y1 + 1, a_min=0, a_max=10000)
+    inter_area = nd.clip(
+        inter_rect_x2 - inter_rect_x1 + 1, a_min=0, a_max=10000) * nd.clip(
+            inter_rect_y2 - inter_rect_y1 + 1, a_min=0, a_max=10000)
 
     # Union Area
     b1_area = (b1_x2 - b1_x1 + 1) * (b1_y2 - b1_y1 + 1)
@@ -135,7 +137,8 @@ def write_results(prediction, num_classes, confidence=0.5, nms_conf=0.4):
         max_conf_score = nd.argmax(image_pred[:, 5:5 + num_classes], axis=1)
         max_conf = max_conf.astype("float32").expand_dims(1)
         max_conf_score = max_conf_score.astype("float32").expand_dims(1)
-        image_pred = nd.concat(image_pred[:, :5], max_conf, max_conf_score, dim=1).asnumpy()
+        image_pred = nd.concat(
+            image_pred[:, :5], max_conf, max_conf_score, dim=1).asnumpy()
         non_zero_ind = np.nonzero(image_pred[:, 4])
         try:
             image_pred_ = image_pred[non_zero_ind, :].reshape((-1, 7))
@@ -150,7 +153,8 @@ def write_results(prediction, num_classes, confidence=0.5, nms_conf=0.4):
 
         for cls in img_classes:
             # get the detections with one particular class
-            cls_mask = image_pred_ * np.expand_dims(image_pred_[:, -1] == cls, axis=1)
+            cls_mask = image_pred_ * np.expand_dims(
+                image_pred_[:, -1] == cls, axis=1)
             class_mask_ind = np.nonzero(cls_mask[:, -2])
             image_pred_class = image_pred_[class_mask_ind].reshape((-1, 7))
 
@@ -181,11 +185,13 @@ def write_results(prediction, num_classes, confidence=0.5, nms_conf=0.4):
 
                 # Remove the non-zero entries
                 non_zero_ind = np.nonzero(image_pred_class[:, 4])
-                image_pred_class = image_pred_class[non_zero_ind].reshape((-1, 7))
+                image_pred_class = image_pred_class[non_zero_ind].reshape((-1,
+                                                                           7))
 
             batch_ind = np.ones((image_pred_class.shape[0], 1)) * ind
 
-            seq = nd.concat(nd.array(batch_ind), nd.array(image_pred_class), dim=1)
+            seq = nd.concat(
+                nd.array(batch_ind), nd.array(image_pred_class), dim=1)
 
             if output is None:
                 output = seq
@@ -199,7 +205,8 @@ def letterbox_image(img, inp_dim, labels=None):
     w, h = inp_dim
     new_w = int(img_w * min(w / img_w, h / img_h))
     new_h = int(img_h * min(w / img_w, h / img_h))
-    resized_image = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    resized_image = cv2.resize(
+        img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
     if labels is not None:
         mask = labels > 0.
         labels[:, 1] = (labels[:, 1] * new_w + (w - new_w) // 2) / w
@@ -209,7 +216,8 @@ def letterbox_image(img, inp_dim, labels=None):
         labels *= mask
     canvas = np.full((inp_dim[1], inp_dim[0], 3), 128, dtype=np.uint8)
 
-    canvas[(h - new_h) // 2:(h - new_h) // 2 + new_h, (w - new_w) // 2:(w - new_w) // 2 + new_w, :] = resized_image
+    canvas[(h - new_h) // 2:(h - new_h) // 2 +
+           new_h, (w - new_w) // 2:(w - new_w) // 2 + new_w, :] = resized_image
 
     return canvas, labels
 
@@ -235,49 +243,66 @@ def load_classes(namesfile):
 def split_and_load(data, ctx):
     n, k = data.shape[0], len(ctx)
     m = n // k
-    return [data[i * m: (i + 1) * m].as_in_context(ctx[i]) for i in range(k)]
+    return [data[i * m:(i + 1) * m].as_in_context(ctx[i]) for i in range(k)]
 
 
 class SigmoidBinaryCrossEntropyLoss(gluon.loss.Loss):
+
     def __init__(self, from_sigmoid=False, weight=1, batch_axis=0, **kwargs):
-        super(SigmoidBinaryCrossEntropyLoss, self).__init__(weight, batch_axis, **kwargs)
+        super(SigmoidBinaryCrossEntropyLoss, self).__init__(
+            weight, batch_axis, **kwargs)
         self._from_sigmoid = from_sigmoid
 
     def hybrid_forward(self, F, pred, label, sample_weight=None):
         label = gluon.loss._reshape_like(F, label, pred)
         if not self._from_sigmoid:
             # We use the stable formula: max(x, 0) - x * z + log(1 + exp(-abs(x)))
-            tmp_loss = F.relu(pred) - pred * label + F.Activation(-F.abs(pred), act_type='softrelu')
+            tmp_loss = F.relu(pred) - pred * label + F.Activation(
+                -F.abs(pred), act_type='softrelu')
         else:
-            tmp_loss = -(F.log(pred + 1e-12) * label + F.log(1. - pred + 1e-12) * (1. - label))
-        tmp_loss = gluon.loss._apply_weighting(F, tmp_loss, self._weight, sample_weight)
+            tmp_loss = -(
+                F.log(pred + 1e-12) * label + F.log(1. - pred + 1e-12) *
+                (1. - label))
+        tmp_loss = gluon.loss._apply_weighting(F, tmp_loss, self._weight,
+                                               sample_weight)
         return tmp_loss
 
 
 class L1Loss(gluon.loss.Loss):
+
     def __init__(self, weight=1, batch_axis=0, **kwargs):
         super(L1Loss, self).__init__(weight, batch_axis, **kwargs)
 
     def hybrid_forward(self, F, pred, label, sample_weight=None):
         label = gluon.loss._reshape_like(F, label, pred)
         tmp_loss = F.abs(pred - label)
-        tmp_loss = gluon.loss._apply_weighting(F, tmp_loss, self._weight, sample_weight)
+        tmp_loss = gluon.loss._apply_weighting(F, tmp_loss, self._weight,
+                                               sample_weight)
         return tmp_loss
 
 
 class L2Loss(gluon.loss.Loss):
+
     def __init__(self, weight=1., batch_axis=0, **kwargs):
         super(L2Loss, self).__init__(weight, batch_axis, **kwargs)
 
     def hybrid_forward(self, F, pred, label, sample_weight=None):
         label = gluon.loss._reshape_like(F, label, pred)
         tmp_loss = F.square(pred - label)
-        tmp_loss = gluon.loss._apply_weighting(F, tmp_loss, self._weight / 2, sample_weight)
+        tmp_loss = gluon.loss._apply_weighting(F, tmp_loss, self._weight / 2,
+                                               sample_weight)
         return tmp_loss
 
 
 class FocalLoss(gluon.loss.Loss):
-    def __init__(self, weight=1, batch_axis=0, gamma=2, eps=1e-7, alpha=0.25, with_ce=False):
+
+    def __init__(self,
+                 weight=1,
+                 batch_axis=0,
+                 gamma=2,
+                 eps=1e-7,
+                 alpha=0.25,
+                 with_ce=False):
         super(FocalLoss, self).__init__(weight=weight, batch_axis=batch_axis)
         self.gamma = gamma
         self.eps = eps
@@ -294,22 +319,25 @@ class FocalLoss(gluon.loss.Loss):
             p_t = sce_loss(pred, label)
             tmp_loss = -(alpha_t * F.power(1 - p_t, self.gamma) * p_t)
         else:
-            p_t = F.clip(F.abs(pred + label - 1.), a_min=self.eps, a_max=1. - self.eps)
+            p_t = F.clip(
+                F.abs(pred + label - 1.), a_min=self.eps, a_max=1. - self.eps)
             tmp_loss = -(alpha_t * F.power(1 - p_t, self.gamma) * F.log(p_t))
-        tmp_loss = gluon.loss._apply_weighting(F, tmp_loss, self._weight, sample_weight)
+        tmp_loss = gluon.loss._apply_weighting(F, tmp_loss, self._weight,
+                                               sample_weight)
         return tmp_loss
 
 
 class HuberLoss(gluon.loss.Loss):
+
     def __init__(self, rho=1, weight=None, batch_axis=0, **kwargs):
         super(HuberLoss, self).__init__(weight, batch_axis, **kwargs)
         self._rho = rho
 
     def hybrid_forward(self, F, pred, label, sample_weight=None):
-        label =gluon.loss. _reshape_like(F, label, pred)
+        label = gluon.loss._reshape_like(F, label, pred)
         loss = F.clip(F.abs(pred - label), a_min=1e-7, a_max=10000.)
         loss = F.where(loss > self._rho, loss - 0.5 * self._rho,
-                       (0.5/self._rho) * F.power(loss, 2))
+                       (0.5 / self._rho) * F.power(loss, 2))
         loss = gluon.loss._apply_weighting(F, loss, self._weight, sample_weight)
         return loss
 
@@ -330,6 +358,7 @@ class LossRecorder(mx.metric.EvalMetric):
 
 
 class MyThread(threading.Thread):
+
     def __init__(self, func, args=()):
         super(MyThread, self).__init__()
         self.func = func
@@ -379,7 +408,8 @@ def prep_label(label_file, classes):
     elif label_file.endswith(".txt"):
         with open(label_file, "r") as file:
             labels = file.readlines()
-            labels = np.array([list(map(float, x.split())) for x in labels], dtype="float32")
+            labels = np.array(
+                [list(map(float, x.split())) for x in labels], dtype="float32")
     elif label_file.endswith(".xml"):
         labels = parse_xml(label_file, classes)
     final_labels = nd.zeros(shape=(30, num_classes + 5), dtype="float32")
@@ -397,13 +427,18 @@ def prep_label(label_file, classes):
 
 def prep_final_label(labels, num_classes, input_dim=416):
     ctx = labels.context
-    anchors = nd.array([(10, 13), (16, 30), (33, 23), (30, 61), (62, 45),
-                        (59, 119), (116, 90), (156, 198), (373, 326)], ctx=ctx)
+    anchors = nd.array(
+        [(10, 13), (16, 30), (33, 23), (30, 61), (62, 45), (59, 119), (116, 90),
+         (156, 198), (373, 326)],
+        ctx=ctx)
     anchors_mask = [[6, 7, 8], [3, 4, 5], [0, 1, 2]]
 
-    label_1 = nd.zeros(shape=(13, 13, 3, num_classes + 5), dtype="float32", ctx=ctx)
-    label_2 = nd.zeros(shape=(26, 26, 3, num_classes + 5), dtype="float32", ctx=ctx)
-    label_3 = nd.zeros(shape=(52, 52, 3, num_classes + 5), dtype="float32", ctx=ctx)
+    label_1 = nd.zeros(
+        shape=(13, 13, 3, num_classes + 5), dtype="float32", ctx=ctx)
+    label_2 = nd.zeros(
+        shape=(26, 26, 3, num_classes + 5), dtype="float32", ctx=ctx)
+    label_3 = nd.zeros(
+        shape=(52, 52, 3, num_classes + 5), dtype="float32", ctx=ctx)
 
     true_label_1 = nd.zeros(shape=(13, 13, 3, 5), dtype="float32", ctx=ctx)
     true_label_2 = nd.zeros(shape=(26, 26, 3, 5), dtype="float32", ctx=ctx)
@@ -415,10 +450,12 @@ def prep_final_label(labels, num_classes, input_dim=416):
         if labels[x_box, 4] == 0.0:
             break
         for i in range(3):
-            stride = 2 ** i * 13
+            stride = 2**i * 13
             tmp_anchors = anchors[anchors_mask[i]]
-            tmp_xywh = nd.repeat(nd.expand_dims(labels[x_box, :4] * stride, axis=0),
-                                 repeats=tmp_anchors.shape[0], axis=0)
+            tmp_xywh = nd.repeat(
+                nd.expand_dims(labels[x_box, :4] * stride, axis=0),
+                repeats=tmp_anchors.shape[0],
+                axis=0)
             anchor_xywh = tmp_xywh.copy()
             anchor_xywh[:, 2:4] = tmp_anchors / input_dim * stride
             best_anchor = nd.argmax(bbox_iou(tmp_xywh, anchor_xywh), axis=0)
@@ -427,7 +464,8 @@ def prep_final_label(labels, num_classes, input_dim=416):
             label[:2] = label[:2] * stride
             label[:2] -= tmp_idx
             tmp_idx = tmp_idx.astype("int")
-            label[2:4] = nd.log(label[2:4] * input_dim / tmp_anchors[best_anchor].reshape(-1) + 1e-12)
+            label[2:4] = nd.log(label[2:4] * input_dim /
+                                tmp_anchors[best_anchor].reshape(-1) + 1e-12)
 
             label_list[i][tmp_idx[1], tmp_idx[0], best_anchor] = label
 
@@ -435,13 +473,15 @@ def prep_final_label(labels, num_classes, input_dim=416):
             true_xywhs[4] = 1.0
             true_label_list[i][tmp_idx[1], tmp_idx[0], best_anchor] = true_xywhs
 
-    t_y = nd.concat(label_1.reshape((-1, num_classes + 5)),
-                    label_2.reshape((-1, num_classes + 5)),
-                    label_3.reshape((-1, num_classes + 5)),
-                    dim=0)
-    t_xywhs = nd.concat(true_label_1.reshape((-1, 5)),
-                        true_label_2.reshape((-1, 5)),
-                        true_label_3.reshape((-1, 5)),
-                        dim=0)
+    t_y = nd.concat(
+        label_1.reshape((-1, num_classes + 5)),
+        label_2.reshape((-1, num_classes + 5)),
+        label_3.reshape((-1, num_classes + 5)),
+        dim=0)
+    t_xywhs = nd.concat(
+        true_label_1.reshape((-1, 5)),
+        true_label_2.reshape((-1, 5)),
+        true_label_3.reshape((-1, 5)),
+        dim=0)
 
     return t_y, t_xywhs
