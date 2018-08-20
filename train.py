@@ -22,7 +22,7 @@ def arg_parse():
         "--classes", dest="classes", default="data/coco.names", type=str)
     parser.add_argument("--prefix", dest="prefix", default="voc")
     parser.add_argument(
-        "--gpu", dest="gpu", help="gpu id", default='0', type=str)
+        "--gpu", dest="gpu", help="gpu id", nargs='+', default='0', type=str)
     parser.add_argument(
         "--dst_dir", dest='dst_dir', default="results", type=str)
     parser.add_argument("--epoch", dest="epoch", default=300, type=int)
@@ -37,7 +37,7 @@ def arg_parse():
         "--params",
         dest='params',
         help="mxnet params file",
-        default="data/yolov3.weights",
+        # default="data/yolov3.weights",
         type=str)
     parser.add_argument("--input_dim", dest='input_dim', default=416, type=int)
 
@@ -46,13 +46,29 @@ def arg_parse():
 
 def calculate_ignore(prediction, true_xywhs, ignore_thresh):
     ctx = prediction.context
+
+    # get the prediction scaled to the original image
+    # TODO input_dim is a global in this context, no bueno
     tmp_pred = predict_transform(prediction, input_dim, anchors)
+
+    # Create an mask full of ones
     ignore_mask = nd.ones(shape=pred_score.shape, dtype="float32", ctx=ctx)
+
+    # get the indices of the items whose ground truth objectivity is 1.0
     item_index = np.argwhere(true_xywhs[:, :, 4].asnumpy() == 1.0)
 
+    # iterate over the items we just retrieved
     for x_box, y_box in item_index:
+        # determine the IOU of the prediction over the ground truth
         iou = bbox_iou(tmp_pred[x_box, y_box:y_box + 1, :4],
                        true_xywhs[x_box, y_box:y_box + 1])
+
+        # Here we are implementing the thing mention on the paper on page 2
+        # essentially we are conscious of super bad bounding boxes. If this
+        # bounding box IoU over the ground truth is < 0.5, we don't want to
+        # consider these values for back propagation. In this case, a value of 1
+        # indicates that we don't want to include this value for training. So
+        # iou < ignore_thresh sets IoUs at or over ignore_thresh to 0
         ignore_mask[x_box, y_box] = (
             iou < ignore_thresh).astype("float32").reshape(-1)
     return ignore_mask
@@ -126,6 +142,7 @@ class YoloDataSet(gluon.data.Dataset):
 
     def __getitem__(self, idx):
         image = cv2.imread(self.image_list[idx])
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         label = prep_label(self.label_list[idx], classes=self.classes)
         image, label = prep_image(image, self.input_dim, label)
         label, true_xywhc = prep_final_label(
@@ -134,25 +151,42 @@ class YoloDataSet(gluon.data.Dataset):
 
 
 if __name__ == '__main__':
+    # parse args
     args = arg_parse()
+
+    # retrieve our image paths
     if args.images_path:
         args.train_data_path = args.images_path
         args.val_data_path = args.images_path
+
+    # get the class list for this dataset
     classes = load_classes(args.classes)
     num_classes = len(classes)
-    gpu = [int(x) for x in args.gpu.replace(" ", "").split(",")]
+
+    # select GPUS (NOTE this only supports 1 gpu)
+    gpu = [int(x) for x in ','.join(args.gpu)]
+
+    # checks the context and returns cpu if gpu doesnt work
     ctx = try_gpu(gpu)
+
+    # get network input size and batch size
     input_dim = args.input_dim
     batch_size = args.batch_size
+
+    # construct a dataset
     train_dataset = YoloDataSet(
         args.train_data_path,
         classes=classes,
         is_shuffle=True,
         mode="train",
         coco_path=args.coco_train)
+
+    # wrap the dataset in a dataloader
     train_dataloader = gluon.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True)
     dataloaders = {"train": train_dataloader}
+
+    # If we provided a validation dataset, create it
     if args.val_data_path:
         val_dataset = YoloDataSet(
             args.val_data_path,
@@ -164,45 +198,59 @@ if __name__ == '__main__':
             val_dataset, batch_size=batch_size, shuffle=True)
         dataloaders["val"] = val_dataloader
 
+    # metrics
     obj_loss = LossRecorder('objectness_loss')
     cls_loss = LossRecorder('classification_loss')
     box_loss = LossRecorder('box_refine_loss')
+
     positive_weight = 1.0
     negative_weight = 1.0
 
+    # loss with 2x weighting (TODO why?)
     l2_loss = L2Loss(weight=2.)
 
+    # construct our network, initialize, move to context
     net = DarkNet(num_classes=num_classes, input_dim=input_dim)
     net.initialize(init=mx.init.Xavier(), ctx=ctx)
-    if args.params.endswith(".params"):
-        net.load
-        _params(args.params)
-    elif args.params.endswith(".weights"):
-        X = nd.uniform(shape=(1, 3, input_dim, input_dim), ctx=ctx[-1])
-        net(X)
-        # net.load_weights(args.params, fine_tune=num_classes != 80)
-    else:
-        print("params {} load error!".format(args.params))
-        exit()
-    print("load params: {}".format(args.params))
+
+    # if we provided weights, load them
+    if args.params is not None:
+        if args.params.endswith(".params"):
+            net.load_params(args.params)
+        elif args.params.endswith(".weights"):
+            X = nd.uniform(shape=(1, 3, input_dim, input_dim), ctx=ctx[-1])
+            net(X)
+            # net.load_weights(args.params, fine_tune=num_classes != 80)
+        else:
+            print("params {} load error!".format(args.params))
+            exit()
+        print("load params: {}".format(args.params))
+
+    # hybridize our network for speed
     net.hybridize()
-    # for _, w in net.collect_params().items():
-    #     if w.name.find("58") == -1 and w.name.find("66") == -1 and w.name.find("74") == -1:
-    #         w.grad_req = "null"
+
+    # anchor box size definition
     anchors = np.array([(10, 13), (16, 30), (33, 23), (30, 61), (62, 45),
                         (59, 119), (116, 90), (156, 198), (373, 326)])
 
+    # determine how many steps this will take
     total_steps = int(np.ceil(len(train_dataset) / batch_size) - 1)
-    print(len(train_dataset))
+    print('Number of training examples: %i' % len(train_dataset))
+
+    # create our learning rate scheduler
     schedule = mx.lr_scheduler.MultiFactorScheduler(
         step=[200 * total_steps], factor=0.1)
+
+    # build our optimizer and trainer
     optimizer = mx.optimizer.Adam(learning_rate=args.lr, lr_scheduler=schedule)
     trainer = gluon.Trainer(net.collect_params(), optimizer=optimizer)
 
     best_loss = 100000.
     early_stop = 0
 
+    # loop over epochs
     for epoch in range(args.epoch):
+        # quit if our loss has increased over last 5 epochs
         if early_stop >= 5:
             print("train stop, epoch: {0}  best loss: {1:.3f}".format(
                 epoch - 5, best_loss))
@@ -210,43 +258,86 @@ if __name__ == '__main__':
         print('Epoch {} / {}'.format(epoch, args.epoch - 1))
         print('-' * 20)
 
+        # alternate train and val
         for mode in ["train", "val"]:
+
+            if mode == 'val' and (epoch + 1) % 5 != 0:
+                # TODO hacky way to only validation once every 5 epochs
+                continue
+
             tic = time.time()
-            if mode == "val":
-                if not args.val_data_path:
-                    continue
-                total_steps = int(np.ceil(len(val_dataset) / batch_size) - 1)
-            else:
-                total_steps = int(np.ceil(len(train_dataset) / batch_size) - 1)
+            if mode not in dataloaders:
+                continue
+
+            # get our total step count
+            total_steps = int(np.ceil(len(dataloaders[mode]) / batch_size) - 1)
+
+            # reset our metrics
             cls_loss.reset()
             obj_loss.reset()
             box_loss.reset()
+
+            # iterate over the dataset
             for i, batch in enumerate(dataloaders[mode]):
+                # split the data amongst contexts (TODO broken)
+                # the image data
                 gpu_Xs = split_and_load(batch[0], ctx)
+
+                # the ground truth image and label data
                 gpu_Ys = split_and_load(batch[1], ctx)
+
+                # the ground truth bounding boxes
                 gpu_Zs = split_and_load(batch[2], ctx)
                 with autograd.record(mode == "train"):
                     loss_list = []
                     batch_num = 0
+                    # iterate over the data split by device (TODO why even do
+                    # this? just as fast as executing all on one device)
                     for gpu_x, gpu_y, gpu_z in zip(gpu_Xs, gpu_Ys, gpu_Zs):
+                        # get the count of items in this batch
                         mini_batch_size = gpu_x.shape[0]
+
+                        # run inference
                         prediction = net(gpu_x)
+
+                        # seperate output into bounding box dimensions,
+                        # objectness, and classification
                         pred_xywh = prediction[:, :, :4]
                         pred_score = prediction[:, :, 4:5]
                         pred_cls = prediction[:, :, 5:]
+
+                        # stop recording (TODO why?)
                         with autograd.pause():
+                            # create a mask for the items that we are actually
+                            # concerned with learning
                             ignore_mask = calculate_ignore(
                                 prediction.copy(), gpu_z, args.ignore_thresh)
+
+                            # seperate our ground truth box, objectivity,
+                            # and classification
                             true_box = gpu_y[:, :, :4]
                             true_score = gpu_y[:, :, 4:5]
                             true_cls = gpu_y[:, :, 5:]
+
+                            # scale the coordinate by the true objectivity
+                            # TODO if we are doing this, what is the point of
+                            # the ignore mask other than the IoU thresholding
                             coordinate_weight = true_score.copy()
+
+                            # Construct a loss for the object and no-object scores
+                            # (Currently this doesn't do shit, is this necessary?)
                             score_weight = nd.where(
                                 coordinate_weight == 1.0,
                                 nd.ones_like(coordinate_weight) *
                                 positive_weight,
                                 nd.ones_like(coordinate_weight) *
                                 negative_weight)
+
+                            # the h * w / input_dimension ^ 2
+                            # appears to scale the height and width back down to
+                            # their original size in the context of grids
+                            # begging the question: TODO why do we rescale so
+                            # much
                             box_loss_scale = 2. - gpu_z[:, :, 2:
                                                         3] * gpu_z[:, :, 3:
                                                                    4] / float(
@@ -254,50 +345,41 @@ if __name__ == '__main__':
                                                                        input_dim
                                                                        **2)
 
+                        # xywh loss with IoU threshold and ground truth factored
+                        # paper suggests using MSE
                         loss_xywh = l2_loss(
                             pred_xywh, true_box,
                             ignore_mask * coordinate_weight * box_loss_scale)
 
+                        # objectivity score. Paper suggests using BCE
                         loss_conf = l2_loss(pred_score, true_score)
 
+                        # classification loss. Paper suggests using BCE
                         loss_cls = l2_loss(pred_cls, true_cls,
                                            coordinate_weight)
 
+                        # sum up the average losses
                         t_loss_xywh = nd.sum(loss_xywh) / mini_batch_size
-
                         t_loss_conf = nd.sum(loss_conf) / mini_batch_size
-
                         t_loss_cls = nd.sum(loss_cls) / mini_batch_size
 
                         loss = t_loss_xywh + t_loss_conf + t_loss_cls
                         batch_num += len(loss)
 
                         if mode == "train":
+                            # backprop and update
                             loss.backward()
                         with autograd.pause():
+                            # don't backprop
                             loss_list.append(loss.asscalar())
                             cls_loss.update([t_loss_cls])
                             obj_loss.update([t_loss_conf])
                             box_loss.update([t_loss_xywh])
 
+                # TODO why do this on validation???
                 trainer.step(batch_num, ignore_stale_grad=True)
 
-                if (i + 1) % int(total_steps / 5) == 0:
-                    mean_loss = 0.
-                    for l in loss_list:
-                        mean_loss += l
-                    mean_loss /= len(loss_list)
-                    print("{0}  epoch: {1}  batch: {2} / {3}  loss: {4:.3f}"
-                          .format(mode, epoch, i, total_steps, mean_loss))
-                if (i + 1) % int(total_steps / 2) == 0:
-                    total_num = nd.sum(coordinate_weight)
-                    item_index = np.nonzero(true_score.asnumpy())
-                    print("predict case / right case: {}".format(
-                        (nd.sum(pred_score > 0.5) / total_num).asscalar()))
-                    print((nd.sum(
-                        nd.abs(pred_score * coordinate_weight - true_score)) /
-                           total_num).asscalar())
-            nd.waitall()
+            # nd.waitall()
             print('Epoch %2d, %s %s %.5f, %s %.5f, %s %.5f time %.1f sec' %
                   (epoch, mode, *cls_loss.get(), *obj_loss.get(),
                    *box_loss.get(), time.time() - tic))

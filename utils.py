@@ -68,20 +68,30 @@ def bbox_iou(box1, box2, transform=True):
 
 
 def predict_transform(prediction, input_dim, anchors):
+    # get the anchor boxes in context
     ctx = prediction.context
     if not isinstance(anchors, nd.NDArray):
         anchors = nd.array(anchors, ctx=ctx)
 
+    # get the batch size, anchor boxes per pyramid, and size of feature maps
     batch_size = prediction.shape[0]
     anchors_masks = [[6, 7, 8], [3, 4, 5], [0, 1, 2]]
     strides = [13, 26, 52]
+
+    # TODO this can automatically be calculated
     step = [(0, 507), (507, 2535), (2535, 10647)]
     for i in range(3):
         stride = strides[i]
         grid = np.arange(stride)
+
+        # basically repeats the above arange both vertically (a) and
+        # horizontally (b)
         a, b = np.meshgrid(grid, grid)
         x_offset = nd.array(a.reshape((-1, 1)), ctx=ctx)
         y_offset = nd.array(b.reshape((-1, 1)), ctx=ctx)
+
+        # creates coordinate pairs. Three for each coordinate
+        # ((0,0), (0,0), (0,0), (0,1), ... (12, 12)
         x_y_offset = \
             nd.repeat(
                 nd.expand_dims(
@@ -93,6 +103,9 @@ def predict_transform(prediction, input_dim, anchors):
                 ),
                 repeats=batch_size, axis=0
             )
+
+        # projects the anchor box sizes to match with the previous x_y_offset
+        # grid setup
         tmp_anchors = \
             nd.repeat(
                 nd.expand_dims(
@@ -107,8 +120,14 @@ def predict_transform(prediction, input_dim, anchors):
                 repeats=batch_size, axis=0
             )
 
+        # add the x,y offset to the xy of the predicition to get the coordinate
+        # relative to the feature map origin instead of the grid location origin
         prediction[:, step[i][0]:step[i][1], :2] += x_y_offset
+
+        # Scale the current feature map to match the input image size
         prediction[:, step[i][0]:step[i][1], :2] *= (float(input_dim) / stride)
+
+        # scale the hw of the prediction to be relative to the anchorboxes
         prediction[:, step[i][0]:step[i][1], 2:4] = \
             nd.exp(prediction[:, step[i][0]:step[i][1], 2:4]) * tmp_anchors
 
@@ -426,13 +445,30 @@ def prep_label(label_file, classes):
 
 
 def prep_final_label(labels, num_classes, input_dim=416):
+    # expected format for labels:
+    # [[x, y, w, h, objectivity, class0, class1, ...],
+    #  [x, y, w, h, objectivity, class0, class1, ...],
+    #  ...
+    #  [x, y, w, h, objectivity, class0, class1, ...]]
+    # Shape: (30, 5 + num_classes)
+    # TODO The number of labels is hardcoded to 30, I think this is the max
+    # number of items in a single image in the dataset. I should check on that
     ctx = labels.context
+
+    # These anchors are borrows from those calculated on the COCO dataset from
+    # the yolo v3 paper
     anchors = nd.array(
         [(10, 13), (16, 30), (33, 23), (30, 61), (62, 45), (59, 119), (116, 90),
          (156, 198), (373, 326)],
         ctx=ctx)
+
+    # This determines which bounding boxes to use at the different pyramids
+    # Looks like the idea is to locate the larger anchor boxes at the
+    # smaller feature maps i.e. further downstream of network
     anchors_mask = [[6, 7, 8], [3, 4, 5], [0, 1, 2]]
 
+    # create empty labels that will eventually contains ground-truth labels with
+    # dimensions relative to the feature map anchor boxes
     label_1 = nd.zeros(
         shape=(13, 13, 3, num_classes + 5), dtype="float32", ctx=ctx)
     label_2 = nd.zeros(
@@ -440,44 +476,91 @@ def prep_final_label(labels, num_classes, input_dim=416):
     label_3 = nd.zeros(
         shape=(52, 52, 3, num_classes + 5), dtype="float32", ctx=ctx)
 
+    # create empty labels that will eventually contain ground-truth labels with
+    # dimensions relative to the source input image
     true_label_1 = nd.zeros(shape=(13, 13, 3, 5), dtype="float32", ctx=ctx)
     true_label_2 = nd.zeros(shape=(26, 26, 3, 5), dtype="float32", ctx=ctx)
     true_label_3 = nd.zeros(shape=(52, 52, 3, 5), dtype="float32", ctx=ctx)
 
     label_list = [label_1, label_2, label_3]
     true_label_list = [true_label_1, true_label_2, true_label_3]
+
+    # loop over the individual labels in this hardcoded label file
     for x_box in range(labels.shape[0]):
+        # if the objectivity score is 0, then we don't care about this label
         if labels[x_box, 4] == 0.0:
             break
+
+        # loop from 0-2 to handle the different pyramid scales
         for i in range(3):
+            # stride == The size of the current feature map
             stride = 2**i * 13
+
+            # the anchor boxes to reference at this pyramid level
             tmp_anchors = anchors[anchors_mask[i]]
+
+            # scale the xywh to the current feature map size so the coordinates
+            # are relative to the feature map
+            # then repeat those values across dimension 0 so we can determine
+            # which bounding box has the highest IoU
             tmp_xywh = nd.repeat(
                 nd.expand_dims(labels[x_box, :4] * stride, axis=0),
                 repeats=tmp_anchors.shape[0],
                 axis=0)
+
+            # copy the previous tensor and plug in the bounding box height and
+            # width. This allows us to retain the correct bounding box centers
+            # and only change the bounding box size
+            # Note that we are scaling the bounding box wh so that they are also
+            # relative to the size of the feature map
             anchor_xywh = tmp_xywh.copy()
             anchor_xywh[:, 2:4] = tmp_anchors / input_dim * stride
+
+            # determine which of these bounding boxes has the highest IoU and
+            # thus is the best anchorbox for this label
             best_anchor = nd.argmax(bbox_iou(tmp_xywh, anchor_xywh), axis=0)
             label = labels[x_box].copy()
+
+            # scale the offsets again (TODO why do this again?), make sure
+            # we have nice round numbers
             tmp_idx = nd.floor(label[:2] * stride)
+
+            # TODO We don't need to calculate this twice
             label[:2] = label[:2] * stride
+
+            # subtract the floored values so that we just get an offset from the
+            # origin of this feature location scaled 0-1
             label[:2] -= tmp_idx
             tmp_idx = tmp_idx.astype("int")
+
+            # calculate the offset of the ground truth from our best fit anchor
+            # box based on equation `p * e ^ (t) where `p` is the anchor box and
+            # `t` is the ground truth label
+
             label[2:4] = nd.log(label[2:4] * input_dim /
                                 tmp_anchors[best_anchor].reshape(-1) + 1e-12)
 
+            # flip the x and y coordinates for some reason (TODO why? does this
+            # work the other way?) and assign to correct grid location and
+            # anchor box. (TODO this doesn't allow for multiple objects in the
+            # same grid location with the same bounding box. what do in that
+            # case?)
             label_list[i][tmp_idx[1], tmp_idx[0], best_anchor] = label
 
+            # scale what we just figured out to the size of the original image
+            # for convenience of display, I guess??? TODO why do this?
             true_xywhs = labels[x_box, :5] * input_dim
             true_xywhs[4] = 1.0
             true_label_list[i][tmp_idx[1], tmp_idx[0], best_anchor] = true_xywhs
 
+    # reshape our network label so it is shape (num_bounding_boxes, 5 + class_count)
     t_y = nd.concat(
         label_1.reshape((-1, num_classes + 5)),
         label_2.reshape((-1, num_classes + 5)),
         label_3.reshape((-1, num_classes + 5)),
         dim=0)
+
+    # reshape our human labels so it is shape(num_bounding_boxes, 5)
     t_xywhs = nd.concat(
         true_label_1.reshape((-1, 5)),
         true_label_2.reshape((-1, 5)),
