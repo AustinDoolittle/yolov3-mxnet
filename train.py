@@ -387,7 +387,7 @@ if __name__ == '__main__':
         if loss < best_loss:
             early_stop = 0
             best_loss = loss
-            net.save_params("./models/{0}_yolov3_mxnet.params".format(
+            net.save_parameters("./models/{0}_yolov3_mxnet.params".format(
                 args.prefix))
         else:
             early_stop += 1
