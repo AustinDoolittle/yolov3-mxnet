@@ -369,14 +369,15 @@ if __name__ == '__main__':
                         if mode == "train":
                             # backprop and update
                             loss.backward()
-                            # TODO why do this on validation???
-                            trainer.step(batch_num)
                         with autograd.pause():
                             # don't backprop
                             loss_list.append(loss.asscalar())
                             cls_loss.update([t_loss_cls])
                             obj_loss.update([t_loss_conf])
                             box_loss.update([t_loss_xywh])
+
+                # TODO why do this on validation???
+                trainer.step(batch_num, ignore_stale_grad=True)
 
             # nd.waitall()
             print('Epoch %2d, %s %s %.5f, %s %.5f, %s %.5f time %.1f sec' %
